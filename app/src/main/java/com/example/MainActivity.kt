@@ -67,6 +67,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import androidx.compose.ui.viewinterop.AndroidView
 import com.example.data.DownloadRecord
 import com.example.ui.theme.*
 import java.io.File
@@ -116,6 +120,7 @@ fun DriveFlowApp(viewModel: MainViewModel = viewModel()) {
                     Screen.HOME -> HomeScreen(viewModel)
                     Screen.HISTORY -> HistoryScreen(history, onClear = { viewModel.clearHistory() }, onDelete = { viewModel.deleteRecord(it) })
                     Screen.LIBRARY -> LibraryScreen()
+                    Screen.SETTINGS -> SettingsScreen(viewModel)
                 }
             }
         }
@@ -145,7 +150,7 @@ fun HomeScreen(viewModel: MainViewModel) {
                 fontWeight = FontWeight.Bold,
             )
             Text(
-                text = "Paste a Google Drive link to start",
+                text = "Paste a download link to start",
                 color = TextSecondary,
                 fontSize = 16.sp,
                 modifier = Modifier.padding(top = 8.dp)
@@ -165,10 +170,13 @@ fun HomeScreen(viewModel: MainViewModel) {
                 onDownload = {
                     try { view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (e: Exception) {}
                     if (url.isNotBlank()) {
-                        viewModel.startDownload(url, context)
+                        val urls = url.split(Regex("\\s+")).filter { it.isNotBlank() }
+                        urls.forEach { 
+                            viewModel.startDownload(it, context)
+                        }
                         url = ""
                     } else {
-                        Toast.makeText(context, "Insert a valid stream link", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Insert a valid download link", Toast.LENGTH_SHORT).show()
                     }
                 }
             )
@@ -186,8 +194,8 @@ fun HomeScreen(viewModel: MainViewModel) {
                     modifier = Modifier.padding(bottom = 16.dp)
                 )
             }
-            items(activeDownloads, key = { it.id }) { download ->
-                ModernTransferCard(download = download, onCancel = { viewModel.cancelDownload(it, context) })
+            items(activeDownloads.values.toList().reversed(), key = { it.id }) { download ->
+                ModernTransferCard(download = download, onCancel = { viewModel.cancelDownload(it, context) }, onPauseResume = { viewModel.togglePause(it, context) })
                 Spacer(modifier = Modifier.height(16.dp))
             }
         }
@@ -213,28 +221,28 @@ fun ModernInputCard(
                 value = url,
                 onValueChange = onUrlChange,
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = TextPrimary, fontSize = 16.sp),
-                singleLine = true,
+                singleLine = false,
+                maxLines = 5,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
-                keyboardActions = KeyboardActions(onGo = { onDownload() }),
                 modifier = Modifier.fillMaxWidth(),
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(SoftAzure),
                 decorationBox = { innerTextField ->
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(56.dp)
+                            .heightIn(min = 56.dp)
                             .clip(RoundedCornerShape(16.dp))
                             .background(DarkSlate)
                             .border(1.dp, SoftBorder, RoundedCornerShape(16.dp))
-                            .padding(horizontal = 16.dp),
-                        contentAlignment = Alignment.CenterStart
+                            .padding(16.dp),
+                        contentAlignment = Alignment.TopStart
                     ) {
                         if (url.isEmpty()) {
                             Text(
-                                "https://drive.google.com/...",
+                                "https://example.com/file1.zip\n...",
                                 color = TextMuted,
                                 fontSize = 16.sp,
-                                maxLines = 1,
+                                maxLines = 5,
                                 overflow = TextOverflow.Ellipsis
                             )
                         }
@@ -243,11 +251,11 @@ fun ModernInputCard(
                         }
                         
                         if (url.isEmpty()) {
-                            IconButton(onClick = onPaste, modifier = Modifier.align(Alignment.CenterEnd)) {
+                            IconButton(onClick = onPaste, modifier = Modifier.align(Alignment.TopEnd).offset(x = 16.dp, y = -16.dp)) {
                                 Icon(Icons.Default.ContentPaste, contentDescription = "Paste", tint = SoftAzure)
                             }
                         } else {
-                            IconButton(onClick = { onUrlChange("") }, modifier = Modifier.align(Alignment.CenterEnd)) {
+                            IconButton(onClick = { onUrlChange("") }, modifier = Modifier.align(Alignment.TopEnd).offset(x = 16.dp, y = -16.dp)) {
                                 Icon(Icons.Default.Close, contentDescription = "Clear", tint = TextMuted)
                             }
                         }
@@ -274,7 +282,7 @@ fun ModernInputCard(
 }
 
 @Composable
-fun ModernTransferCard(download: ActiveDownload, onCancel: (Long) -> Unit) {
+fun ModernTransferCard(download: DownloadInfo, onCancel: (Long) -> Unit, onPauseResume: (Long) -> Unit) {
     val animatedProgress by animateFloatAsState(
         targetValue = download.progress.coerceIn(0f, 1f),
         animationSpec = spring(stiffness = Spring.StiffnessLow),
@@ -285,13 +293,14 @@ fun ModernTransferCard(download: ActiveDownload, onCancel: (Long) -> Unit) {
         color = CloudSurface,
         shape = RoundedCornerShape(20.dp),
         border = BorderStroke(1.dp, MutedBorder),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier.fillMaxWidth().clickable { onPauseResume(download.id) }
     ) {
         Column(modifier = Modifier.padding(20.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                val isFailed = download.status == DownloadManager.STATUS_FAILED
-                val isComplete = download.status == DownloadManager.STATUS_SUCCESSFUL
-                val statusColor = if (isFailed) Color(0xFFE57373) else if (isComplete) Color(0xFF81C784) else SoftAzure
+                val isFailed = download.state == DownloadState.FAILED
+                val isComplete = download.state == DownloadState.COMPLETED
+                val isPaused = download.state == DownloadState.PAUSED
+                val statusColor = if (isFailed) Color(0xFFE57373) else if (isComplete) Color(0xFF81C784) else if (isPaused) Color(0xFFFFB74D) else SoftAzure
                 
                 Box(modifier = Modifier.size(52.dp), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator(
@@ -306,6 +315,8 @@ fun ModernTransferCard(download: ActiveDownload, onCancel: (Long) -> Unit) {
                         Icon(Icons.Default.Check, contentDescription = null, tint = Color(0xFF81C784))
                     } else if (isFailed) {
                         Icon(Icons.Default.Close, contentDescription = null, tint = Color(0xFFE57373))
+                    } else if (isPaused) {
+                        Text("||", color = Color(0xFFFFB74D), fontWeight = FontWeight.ExtraBold, fontSize = 20.sp)
                     } else {
                         Icon(Icons.Default.Download, contentDescription = null, tint = SoftAzure)
                     }
@@ -314,17 +325,17 @@ fun ModernTransferCard(download: ActiveDownload, onCancel: (Long) -> Unit) {
                 Spacer(modifier = Modifier.width(16.dp))
                 
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(download.title, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(download.fileName, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Spacer(modifier = Modifier.height(4.dp))
                     val downloadedMb = download.bytesDownloaded / (1024 * 1024)
                     val totalMb = if (download.bytesTotal > 0) (download.bytesTotal / (1024 * 1024)).toString() else "?"
-                    val speedText = formatSpeed(download.speedBytesPerSec)
+                    val speedText = formatSpeed(download.speed)
                     Text(
-                        text = if (isFailed) "Failed" else if (isComplete) "Completed • $totalMb MB" else "$downloadedMb MB of $totalMb MB",
+                        text = if (isFailed) "Failed: ${download.error ?: "Error"}" else if (isComplete) "Completed • $totalMb MB" else if (isPaused) "Paused" else "$downloadedMb MB of $totalMb MB",
                         color = TextSecondary,
                         fontSize = 13.sp
                     )
-                    if (!isFailed && !isComplete && download.speedBytesPerSec > 0) {
+                    if (!isFailed && !isComplete && !isPaused && download.speed > 0) {
                         Text(speedText, color = SoftAzure, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 2.dp))
                     }
                 }
@@ -394,55 +405,101 @@ fun HistoryScreen(history: List<DownloadRecord>, onClear: () -> Unit, onDelete: 
 }
 
 @Composable
+fun ExoPlayerView(file: File) {
+    val context = LocalContext.current
+    val exoPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            val uri = Uri.fromFile(file)
+            val mediaItem = MediaItem.fromUri(uri)
+            setMediaItem(mediaItem)
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            exoPlayer.release()
+        }
+    }
+
+    AndroidView(
+        factory = {
+            PlayerView(context).apply {
+                player = exoPlayer
+            }
+        },
+        modifier = Modifier.fillMaxSize()
+    )
+}
+
+@Composable
 fun LibraryScreen() {
     var downloadedFiles by remember { mutableStateOf(getDownloadedFiles()) }
     val context = LocalContext.current
     val view = LocalView.current
+    var playingFile by remember { mutableStateOf<File?>(null) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("Local Vault", color = TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.Light)
-            Text("${downloadedFiles.size} items", color = SoftAzure, fontSize = 14.sp)
-        }
-
-        if (downloadedFiles.isEmpty()) {
-            EmptyState("No local files found.", "Downloaded media is stored in your Downloads.")
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(bottom = 24.dp)
+    if (playingFile != null) {
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+            ExoPlayerView(playingFile!!)
+            IconButton(
+                onClick = { playingFile = null },
+                modifier = Modifier.padding(16.dp).align(Alignment.TopStart)
             ) {
-                items(downloadedFiles) { file ->
-                    FileItem(
-                        file = file,
-                        onDelete = {
-                            try { view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP) } catch (e: Exception) {}
-                            if (file.delete()) {
-                                downloadedFiles = getDownloadedFiles()
-                                Toast.makeText(context, "File removed from device", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        onOpen = {
-                            try {
-                                val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
-                                val intent = Intent(Intent.ACTION_VIEW).apply {
-                                    setDataAndType(uri, "*/*")
-                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
+            }
+        }
+    } else {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 24.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Local Vault", color = TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.Light)
+                Text("${downloadedFiles.size} items", color = SoftAzure, fontSize = 14.sp)
+            }
+
+            if (downloadedFiles.isEmpty()) {
+                EmptyState("No local files found.", "Downloaded media is stored in your Downloads.")
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(bottom = 24.dp)
+                ) {
+                    items(downloadedFiles) { file ->
+                        FileItem(
+                            file = file,
+                            onDelete = {
+                                try { view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP) } catch (e: Exception) {}
+                                if (file.delete()) {
+                                    downloadedFiles = getDownloadedFiles()
+                                    Toast.makeText(context, "File removed from device", Toast.LENGTH_SHORT).show()
                                 }
-                                context.startActivity(Intent.createChooser(intent, "Open file"))
-                            } catch (e: Exception) {
-                                Toast.makeText(context, "Cannot open this file", Toast.LENGTH_SHORT).show()
-                            }
-                        },
+                            },
+                            onOpen = {
+                                val extension = file.extension.lowercase()
+                                if (extension in listOf("mp4", "mkv", "mp3", "wav", "m4a")) {
+                                    playingFile = file
+                                } else {
+                                    try {
+                                        val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+                                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                                            setDataAndType(uri, "*/*")
+                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        context.startActivity(Intent.createChooser(intent, "Open file"))
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Cannot open this file", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
                         onShare = {
                             try {
                                 val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
@@ -461,6 +518,7 @@ fun LibraryScreen() {
             }
         }
     }
+}
 }
 
 @Composable
@@ -636,6 +694,10 @@ fun BottomNavBar(currentScreen: Screen, onScreenSelected: (Screen) -> Unit) {
                 try { view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK) } catch (e: Exception) {}
                 onScreenSelected(Screen.LIBRARY)
             }
+            NavPill(icon = Icons.Default.Settings, label = "Settings", active = currentScreen == Screen.SETTINGS, modifier = Modifier.weight(1f)) {
+                try { view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK) } catch (e: Exception) {}
+                onScreenSelected(Screen.SETTINGS)
+            }
         }
     }
 }
@@ -675,6 +737,77 @@ fun NavPill(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Medium
                     )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingsScreen(viewModel: MainViewModel) {
+    val wifiOnly by viewModel.wifiOnly.collectAsStateWithLifecycle()
+    val concurrentLimit by viewModel.concurrentLimit.collectAsStateWithLifecycle()
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Settings", color = TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.Light)
+        }
+        
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Surface(
+            color = CloudSurface,
+            shape = RoundedCornerShape(20.dp),
+            border = BorderStroke(1.dp, MutedBorder),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(20.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Wi-Fi Only Downloads", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                        Text("Pause transfers on cellular networks", color = TextSecondary, fontSize = 13.sp)
+                    }
+                    Switch(
+                        checked = wifiOnly,
+                        onCheckedChange = { viewModel.setWifiOnly(it) },
+                        colors = SwitchDefaults.colors(checkedThumbColor = DarkDeepBlue, checkedTrackColor = SoftAzure)
+                    )
+                }
+                
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp), color = MutedBorder)
+                
+                val limits = listOf(1, 2, 4, 8)
+                Text("Concurrent Download Limit", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    limits.forEach { limit ->
+                        val isSelected = concurrentLimit == limit
+                        Surface(
+                            shape = CircleShape,
+                            color = if (isSelected) SoftAzure else DarkSlate,
+                            modifier = Modifier.size(48.dp).clickable { viewModel.setConcurrentLimit(limit) },
+                            border = BorderStroke(1.dp, if (isSelected) SoftAzure else MutedBorder)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text("$limit", color = if (isSelected) DarkDeepBlue else TextPrimary, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
                 }
             }
         }

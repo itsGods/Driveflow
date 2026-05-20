@@ -1,17 +1,13 @@
 package com.example
 
 import android.app.Application
-import android.app.DownloadManager
 import android.content.Context
-import android.net.Uri
-import android.os.Environment
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.AppDatabase
 import com.example.data.DownloadRecord
 import com.example.data.DownloadRepository
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -20,18 +16,8 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 enum class Screen {
-    HOME, HISTORY, LIBRARY
+    HOME, HISTORY, LIBRARY, SETTINGS
 }
-
-data class ActiveDownload(
-    val id: Long,
-    val title: String,
-    val progress: Float,
-    val status: Int,
-    val bytesDownloaded: Long,
-    val bytesTotal: Long,
-    val speedBytesPerSec: Long = 0L
-)
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository: DownloadRepository
@@ -40,12 +26,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentScreen = MutableStateFlow(Screen.HOME)
     val currentScreen = _currentScreen.asStateFlow()
 
-    private val _activeDownloads = MutableStateFlow<List<ActiveDownload>>(emptyList())
-    val activeDownloads = _activeDownloads.asStateFlow()
+    private val _wifiOnly = MutableStateFlow(false)
+    val wifiOnly = _wifiOnly.asStateFlow()
 
-    private val trackedDownloadIds = mutableSetOf<Long>()
-    private val lastBytesMap = mutableMapOf<Long, Pair<Long, Long>>() // id -> (time, bytes)
-    private var isPolling = false
+    private val _concurrentLimit = MutableStateFlow(4)
+    val concurrentLimit = _concurrentLimit.asStateFlow()
+
+    fun setWifiOnly(value: Boolean) {
+        _wifiOnly.value = value
+        DownloadEngine.wifiOnly = value
+    }
+
+    fun setConcurrentLimit(value: Int) {
+        _concurrentLimit.value = value
+        DownloadEngine.concurrentLimit = value
+    }
+
+    val activeDownloads = DownloadEngine.activeDownloads
 
     init {
         val dao = AppDatabase.getDatabase(application).downloadDao()
@@ -62,113 +59,84 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startDownload(url: String, context: Context) {
-        val fileId = extractFileId(url)
-        if (fileId == null) {
-            Toast.makeText(context, "Invalid Google Drive link", Toast.LENGTH_SHORT).show()
-            return
+        val finalUrl = if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            "https://$url"
+        } else url
+
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            var downloadUrl = finalUrl
+            val fileName: String
+
+            if (finalUrl.contains("drive.google.com")) {
+                val fileId = extractFileId(finalUrl)
+                if (fileId != null) {
+                    fileName = "Drive_${fileId}.ext"
+                    downloadUrl = try {
+                        resolveDriveUrl(fileId)
+                    } catch (e: Exception) {
+                        "https://drive.google.com/uc?export=download&confirm=t&id=$fileId"
+                    }
+                } else {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        Toast.makeText(context, "Invalid Google Drive link", Toast.LENGTH_SHORT).show()
+                    }
+                    return@launch
+                }
+            } else {
+                val guessedName = android.webkit.URLUtil.guessFileName(finalUrl, null, null)
+                fileName = if (guessedName.isNullOrBlank() || guessedName == "bin") "Download_${System.currentTimeMillis()}" else guessedName
+            }
+
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                enqueueDownload(downloadUrl, fileName, url, context)
+            }
         }
-        val downloadUrl = "https://drive.google.com/uc?export=download&id=$fileId"
-        val fileName = "DriveFlow_$fileId"
-        val request = DownloadManager.Request(Uri.parse(downloadUrl))
-            .setTitle(fileName)
-            .setDescription("Fetching file from Cloud...")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-            .setAllowedOverMetered(true)
-            .setAllowedOverRoaming(true)
+    }
 
-        try {
-            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-            val downloadId = dm.enqueue(request)
-            trackedDownloadIds.add(downloadId)
-            
-            viewModelScope.launch {
-                repository.insert(DownloadRecord(url = url, fileName = fileName))
-            }
-            
-            Toast.makeText(context, "Download Stream Connected", Toast.LENGTH_SHORT).show()
+    private fun resolveDriveUrl(fileId: String): String {
+        val initialUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+        val connection = java.net.URL(initialUrl).openConnection() as java.net.HttpURLConnection
+        connection.instanceFollowRedirects = false
+        connection.connect()
 
-            if (!isPolling) {
-                startPolling(dm)
+        val cookie = connection.getHeaderField("Set-Cookie")?.split(";")?.get(0)
+        
+        if (connection.responseCode == java.net.HttpURLConnection.HTTP_OK) {
+            val scanner = java.util.Scanner(connection.inputStream).useDelimiter("\\A")
+            val html = if (scanner.hasNext()) scanner.next() else ""
+            val confirmRegex = "confirm=([^&\"'>]+)".toRegex()
+            val match = confirmRegex.find(html)
+            if (match != null) {
+                val confirmToken = match.groupValues[1]
+                return "https://drive.google.com/uc?export=download&id=$fileId&confirm=$confirmToken"
             }
-        } catch (e: Exception) {
-            Toast.makeText(context, "Error: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+        }
+        return "https://drive.google.com/uc?export=download&confirm=t&id=$fileId"
+    }
+
+    private fun enqueueDownload(downloadUrl: String, fileName: String, originalUrl: String, context: Context) {
+        DownloadEngine.enqueue(context, downloadUrl, fileName)
+        Toast.makeText(context, "Download processing started", Toast.LENGTH_SHORT).show()
+        viewModelScope.launch {
+            repository.insert(DownloadRecord(url = originalUrl, fileName = fileName))
         }
     }
 
     fun cancelDownload(id: Long, context: Context) {
-        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        dm.remove(id)
-        trackedDownloadIds.remove(id)
-        lastBytesMap.remove(id)
+        DownloadEngine.cancel(id)
+    }
+    
+    fun togglePause(id: Long, context: Context) {
+        val info = activeDownloads.value[id] ?: return
+        if (info.state == DownloadState.PAUSED || info.state == DownloadState.FAILED) {
+            DownloadEngine.resume(context, id)
+        } else {
+            DownloadEngine.pause(id)
+        }
     }
 
-    private fun startPolling(dm: DownloadManager) {
-        isPolling = true
-        viewModelScope.launch {
-            while (trackedDownloadIds.isNotEmpty()) {
-                try {
-                    val query = DownloadManager.Query().setFilterById(*trackedDownloadIds.toLongArray())
-                    val cursor = dm.query(query)
-                    val currentList = mutableListOf<ActiveDownload>()
-                    val completedIds = mutableListOf<Long>()
-                    
-                    if (cursor != null && cursor.moveToFirst()) {
-                        do {
-                            val idIndex = cursor.getColumnIndex(DownloadManager.COLUMN_ID)
-                            val titleIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TITLE)
-                            val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
-                            val bytesDownloadedIndex = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
-                            val bytesTotalIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
-                            
-                            if (idIndex < 0 || statusIndex < 0) continue
-
-                            val id = cursor.getLong(idIndex)
-                            val title = if (titleIndex >= 0) cursor.getString(titleIndex) ?: "Unknown" else "Unknown"
-                            val status = cursor.getInt(statusIndex)
-                            val bytesDownloaded = if (bytesDownloadedIndex >= 0) cursor.getLong(bytesDownloadedIndex) else 0L
-                            val bytesTotal = if (bytesTotalIndex >= 0) cursor.getLong(bytesTotalIndex) else 0L
-                            
-                            val progress = if (bytesTotal > 0L) (bytesDownloaded.toFloat() / bytesTotal.toFloat()).coerceIn(0f, 1f) else 0f
-                            val safeProgress = if (progress.isNaN()) 0f else progress
-                            
-                            val currentTime = System.currentTimeMillis()
-                            val previous = lastBytesMap[id]
-                            var speed = 0L
-                            if (previous != null) {
-                                val timeDiff = currentTime - previous.first
-                                if (timeDiff > 0L) {
-                                    speed = ((bytesDownloaded - previous.second) * 1000L) / timeDiff
-                                }
-                            }
-                            if (speed < 0L) speed = 0L
-                            lastBytesMap[id] = Pair(currentTime, bytesDownloaded)
-
-                            currentList.add(ActiveDownload(id, title, safeProgress, status, bytesDownloaded, bytesTotal, speed))
-                            
-                            if (status == DownloadManager.STATUS_SUCCESSFUL || status == DownloadManager.STATUS_FAILED) {
-                                completedIds.add(id)
-                            }
-                        } while (cursor.moveToNext())
-                        cursor.close()
-                    } else {
-                        cursor?.close()
-                        trackedDownloadIds.clear()
-                    }
-                    
-                    _activeDownloads.value = currentList
-                    trackedDownloadIds.removeAll(completedIds)
-                    completedIds.forEach { lastBytesMap.remove(it) }
-                } catch(e: Exception) {
-                    trackedDownloadIds.clear()
-                    _activeDownloads.value = emptyList()
-                }
-                
-                delay(800) // Poll UI every 800ms to stay relatively fresh
-            }
-            _activeDownloads.value = emptyList()
-            isPolling = false
-        }
+    fun clearFinishedDownloads() {
+        DownloadEngine.clearFinished()
     }
 
     private fun extractFileId(url: String): String? {
