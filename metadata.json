@@ -1,0 +1,6 @@
+{
+  "name": "DriveFlow",
+  "description": "A premium, handcrafted Google Drive downloader for large files and media with a focused, glassmorphic interface.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
